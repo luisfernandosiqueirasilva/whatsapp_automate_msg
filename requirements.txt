@@ -1,0 +1,4 @@
+# WAM usa apenas a biblioteca padrão, exceto para o envio real via WhatsApp Web.
+# Selenium >= 4.6 é necessário para que o Selenium Manager provisione o
+# chromedriver automaticamente (sem precisar baixá-lo manualmente).
+selenium>=4.6.0
