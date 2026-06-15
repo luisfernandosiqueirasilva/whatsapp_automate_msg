@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  WAM - WhatsApp Automate Message v5.3                                       ║
-║  COM INTEGRAÇÃO REAL COM WHATSAPP WEB (Selenium)                           ║
+║  WAM - WhatsApp Automate Message v5.4                                       ║
+║  VERSÃO COMPLETA - CORREÇÕES DE DEADLOCK + SELETORES ROBUSTOS              ║
 ║  Responsabilidade EXCLUSIVA do usuário - LGPD Rigorosa                      ║
 ║  github.com/luisfernandosiqueirasilva/whatsapp_automate_msg                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -28,6 +28,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Dict
 
 # ============================================================================
 # VERIFICAÇÃO DO SISTEMA OPERACIONAL
@@ -116,7 +117,7 @@ class LoggerAuditoria:
         self.pasta_logs = base_path / "logs_auditoria"
         self.pasta_logs.mkdir(parents=True, exist_ok=True)
         self.arquivo = self.pasta_logs / f"auditoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
     
     def log(self, evento: str, dados: dict = None):
         with self._lock:
@@ -318,38 +319,35 @@ Workbook = WorkbookNativo
 load_workbook = load_workbook_nativo
 
 # ============================================================================
-# WHATSAPP REAL COM SELENIUM
+# WHATSAPP REAL COM SELENIUM (CORRIGIDO)
 # ============================================================================
 
 class WhatsAppReal:
-    # WhatsApp Web muda o DOM com frequência; tentamos vários seletores em ordem.
+    # Caixa de mensagem restrita ao rodapé (compositor). Nunca incluir a caixa
+    # de busca (data-tab='3'), senão a mensagem seria digitada no lugar errado.
     _SELETORES_CAIXA = [
-        '//footer//div[@contenteditable="true"][@role="textbox"]',
-        '//footer//div[@contenteditable="true"]',
-        '//div[@contenteditable="true"][@data-tab="10"]',
-        '//div[@contenteditable="true"][@data-tab="6"]',
-    ]
-    _SELETORES_LOGADO = [
-        "div[aria-label='Chat list']",
-        "div[data-testid='chat-list']",
-        "#side",
-        "div[contenteditable='true'][data-tab='3']",
+        "footer div[contenteditable='true'][role='textbox']",
+        "footer div[contenteditable='true']",
+        "div[contenteditable='true'][data-tab='10']",
+        "div[contenteditable='true'][data-tab='6']",
     ]
 
     def __init__(self, logger: LoggerAuditoria, base_path: Path):
         self.logger = logger
         self.base_path = base_path
         self.driver = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conectado = False
     
     def conectar(self) -> bool:
-        """Conecta ao WhatsApp Web"""
+        """Conecta ao WhatsApp Web com seletores robustos"""
         try:
             from selenium import webdriver
             from selenium.webdriver.chrome.options import Options
             from selenium.webdriver.common.by import By
             from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            from selenium.common.exceptions import TimeoutException
         except ImportError:
             self.logger.log("ERRO: Selenium não instalado. Execute: pip install selenium")
             return False
@@ -370,14 +368,32 @@ class WhatsAppReal:
             print("\n📱 Escaneie o QR Code do WhatsApp Web...")
             print("Aguardando login (até 90 segundos)...")
             
-            # Aguarda o login concluir (QR Code escaneado). O DOM do WhatsApp
-            # Web varia, então procuramos por qualquer indicador de sessão ativa.
-            def _logado(driver):
-                return any(
-                    driver.find_elements(By.CSS_SELECTOR, css)
-                    for css in self._SELETORES_LOGADO
-                )
-            WebDriverWait(self.driver, 90).until(_logado)
+            # Aguarda o chat principal carregar - seletores robustos
+            wait = WebDriverWait(self.driver, 90)
+            
+            # Múltiplos seletores de fallback
+            seletores_login = [
+                "div[data-testid='chat-list']",
+                "div[data-testid='pane-side']",
+                "div[contenteditable='true'][data-tab='3']",
+                "div[contenteditable='true'][data-tab='6']",
+                "div[contenteditable='true'][data-tab='10']",
+                "footer div[contenteditable='true']"
+            ]
+            
+            login_ok = False
+            for seletor in seletores_login:
+                try:
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, seletor)))
+                    login_ok = True
+                    self.logger.log(f"LOGIN_OK_SELETOR: {seletor}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not login_ok:
+                self.logger.log("ERRO_LOGIN_SELETORES")
+                return False
             
             self._conectado = True
             self.logger.log("WHATSAPP_CONECTADO")
@@ -388,8 +404,69 @@ class WhatsAppReal:
             self.logger.log(f"ERRO_CONEXAO_WHATSAPP: {str(e)[:100]}")
             return False
     
+    def _enviar_mensagem_como_texto(self, caixa, mensagem: str):
+        """Envia mensagem multi-linha sem quebrar em ENTER"""
+        from selenium.webdriver.common.keys import Keys
+        
+        linhas = mensagem.split('\n')
+        for i, linha in enumerate(linhas):
+            if i > 0:
+                # SHIFT+ENTER para nova linha sem enviar
+                caixa.send_keys(Keys.SHIFT, Keys.ENTER)
+            caixa.send_keys(linha)
+            time.sleep(0.05)
+        # Enter final para enviar
+        caixa.send_keys(Keys.ENTER)
+    
+    def _numero_tem_whatsapp(self, telefone: str) -> bool:
+        """Navega para o número e decide com um único wait.
+
+        Retorna False apenas quando o aviso de número inválido é detectado;
+        em qualquer outra situação assume que o número é válido.
+        """
+        if not self.driver:
+            return True
+        
+        try:
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.common.exceptions import TimeoutException
+            
+            url = f"https://web.whatsapp.com/send?phone={telefone}"
+            self.driver.get(url)
+            
+            marcadores_erro = [
+                "not on whatsapp",
+                "não está no whatsapp",
+                "phone number shared via url is invalid",
+                "número de telefone compartilhado por url é inválido",
+            ]
+            
+            # Um único wait: termina assim que a caixa aparece (válido) ou que
+            # o aviso de número inválido é detectado no texto da página.
+            def _estado(driver):
+                for css in self._SELETORES_CAIXA:
+                    if driver.find_elements(By.CSS_SELECTOR, css):
+                        return "ok"
+                try:
+                    corpo = driver.find_element(By.TAG_NAME, "body").text.lower()
+                except Exception:
+                    return False
+                if any(m in corpo for m in marcadores_erro):
+                    return "invalido"
+                return False
+            
+            try:
+                resultado = WebDriverWait(self.driver, 15).until(_estado)
+            except TimeoutException:
+                return True
+            return resultado == "ok"
+            
+        except Exception:
+            return True
+    
     def enviar(self, telefone: str, mensagem: str) -> bool:
-        """Envia mensagem via WhatsApp Web"""
+        """Envia mensagem via WhatsApp Web com fallbacks robustos"""
         if not self._conectado or not self.driver:
             self.logger.log("WHATSAPP_NAO_CONECTADO")
             return False
@@ -402,27 +479,34 @@ class WhatsAppReal:
             try:
                 from selenium.webdriver.common.by import By
                 from selenium.webdriver.support.ui import WebDriverWait
-                from selenium.webdriver.common.keys import Keys
                 
-                url = f"https://web.whatsapp.com/send?phone={telefone}"
-                self.driver.get(url)
+                # Navega para o número e verifica se ele tem WhatsApp.
+                if not self._numero_tem_whatsapp(telefone):
+                    self.logger.log(f"NUMERO_SEM_WHATSAPP: {telefone[:8]}***")
+                    return False
                 
-                wait = WebDriverWait(self.driver, 30)
-                caixa_mensagem = self._aguardar_caixa_mensagem(wait, By)
-                if caixa_mensagem is None:
-                    if self._numero_invalido(By):
-                        self.logger.log(f"NUMERO_SEM_WHATSAPP: {telefone[:8]}***")
-                    else:
-                        self.logger.log(f"CAIXA_MSG_NAO_ENCONTRADA: {telefone[:8]}***")
+                # Caixa de mensagem: apenas o compositor no rodapé, nunca a
+                # caixa de busca, para não digitar a mensagem no lugar errado.
+                def _caixa(driver):
+                    for css in self._SELETORES_CAIXA:
+                        for el in driver.find_elements(By.CSS_SELECTOR, css):
+                            if el.is_displayed():
+                                return el
+                    return False
+                
+                try:
+                    caixa_mensagem = WebDriverWait(self.driver, 15).until(_caixa)
+                except Exception:
+                    caixa_mensagem = None
+                
+                if not caixa_mensagem:
+                    self.logger.log("CAIXA_MENSAGEM_NAO_ENCONTRADA")
                     return False
                 
                 time.sleep(1)
                 
-                # Digita a mensagem multi-linha sem enviar prematuramente
-                # (ENTER envia no WhatsApp Web; usamos SHIFT+ENTER para quebras).
-                self._digitar_mensagem(caixa_mensagem, mensagem, Keys)
-                time.sleep(0.5)
-                caixa_mensagem.send_keys(Keys.ENTER)
+                # Envia mensagem multi-linha
+                self._enviar_mensagem_como_texto(caixa_mensagem, mensagem)
                 time.sleep(2)
                 
                 self.logger.log("MSG_ENVIADA", {'telefone': telefone[:8] + '***'})
@@ -432,236 +516,10 @@ class WhatsAppReal:
                 self.logger.log(f"ERRO_ENVIO_WHATSAPP: {str(e)[:100]}")
                 return False
     
-    def _aguardar_caixa_mensagem(self, wait, By):
-        """Localiza a caixa de mensagem testando vários seletores em paralelo."""
-        from selenium.common.exceptions import TimeoutException
-        
-        def _encontrar(driver):
-            for xpath in self._SELETORES_CAIXA:
-                for el in driver.find_elements(By.XPATH, xpath):
-                    if el.is_displayed():
-                        return el
-            return False
-        
-        try:
-            return wait.until(_encontrar)
-        except TimeoutException:
-            return None
-    
-    def _numero_invalido(self, By) -> bool:
-        """Detecta o aviso de número sem WhatsApp exibido após o /send."""
-        marcadores = [
-            "phone number shared via url is invalid",
-            "número de telefone compartilhado por url é inválido",
-            "telefone compartilhado por meio de url é inválido",
-        ]
-        try:
-            corpo = self.driver.find_element(By.TAG_NAME, "body").text.lower()
-            return any(m in corpo for m in marcadores)
-        except Exception:
-            return False
-    
-    def _digitar_mensagem(self, caixa, mensagem: str, Keys):
-        """Digita texto multi-linha usando SHIFT+ENTER para as quebras."""
-        for i, linha in enumerate(mensagem.split('\n')):
-            if i > 0:
-                caixa.send_keys(Keys.SHIFT, Keys.ENTER)
-            if linha:
-                caixa.send_keys(linha)
-    
     def fechar(self):
         if self.driver:
             self.driver.quit()
             self._conectado = False
-
-
-# ============================================================================
-# FILA PRIORITÁRIA COM CONSUMIDOR REAL
-# ============================================================================
-
-class FilaPrioritaria:
-    def __init__(self, logger: LoggerAuditoria, whatsapp: WhatsAppReal, base_path: Path):
-        self.logger = logger
-        self.whatsapp = whatsapp
-        self.base_path = base_path
-        self.fila = queue.PriorityQueue()
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        self.rodando = True
-        self.enviados = set()
-        self.falhas = {}
-        # RLock (reentrante): _enviar mantém o lock e chama _salvar_historico,
-        # que também adquire o mesmo lock.
-        self._lock = threading.RLock()
-        self._start_worker()
-    
-    def _start_worker(self):
-        def worker():
-            while self.rodando:
-                try:
-                    item = self.fila.get(timeout=1)
-                    self.executor.submit(self._enviar, item)
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    self.logger.log(f"ERRO_WORKER: {str(e)[:50]}")
-        
-        threading.Thread(target=worker, daemon=True).start()
-    
-    def _enviar(self, item: ConsultaPriorizada):
-        try:
-            dados = item.dados
-            consulta = dados['consulta']
-            medico = dados['medico']
-            chave = dados['chave']
-            
-            # Verifica duplicata
-            chave_unica = f"{consulta.get('nome', '')}_{medico}_{consulta.get('data', '')}"
-            
-            with self._lock:
-                if chave_unica in self.enviados:
-                    self.logger.log(f"DUPLICADA IGNORADA: {chave_unica}")
-                    return
-            
-            mensagem = self._montar_mensagem(consulta, medico, chave)
-            telefone = self._normalizar_telefone(consulta.get('telefone', ''))
-            
-            sucesso = self.whatsapp.enviar(telefone, mensagem)
-            
-            with self._lock:
-                if sucesso:
-                    self.enviados.add(chave_unica)
-                    self._salvar_historico(consulta, medico, chave, sucesso)
-                    status = 'OK'
-                else:
-                    # Registra falha para possível retry
-                    self.falhas[chave_unica] = self.falhas.get(chave_unica, 0) + 1
-                    if self.falhas[chave_unica] < 3:
-                        # Recoloca na fila com prioridade mais baixa
-                        novo_item = ConsultaPriorizada(
-                            prioridade=Prioridade.BAIXA.value,
-                            timestamp=time.time(),
-                            consulta_id=item.consulta_id,
-                            dados=item.dados,
-                            tentativas=item.tentativas + 1
-                        )
-                        self.fila.put(novo_item)
-                        status = f'RETRY {self.falhas[chave_unica]}'
-                    else:
-                        self._salvar_historico(consulta, medico, chave, sucesso)
-                        status = 'FALHA_PERMANENTE'
-            
-            self.logger.log(f"ENVIO: {consulta.get('nome', '?')[:15]} | {status}")
-            
-        except Exception as e:
-            self.logger.log(f"ERRO_ENVIO: {str(e)[:50]}")
-    
-    def _normalizar_telefone(self, telefone: str) -> str:
-        if not telefone:
-            return ""
-        apenas_numeros = re.sub(r'\D', '', telefone)
-        if len(apenas_numeros) < 10:
-            return ""
-        if len(apenas_numeros) == 10:
-            return "55" + apenas_numeros
-        if len(apenas_numeros) == 11:
-            return "55" + apenas_numeros
-        if len(apenas_numeros) == 13 and apenas_numeros.startswith('55'):
-            return apenas_numeros
-        return "55" + apenas_numeros[-11:] if len(apenas_numeros) > 11 else ""
-    
-    def _salvar_historico(self, consulta: dict, medico: str, chave: str, sucesso: bool):
-        with self._lock:
-            historico_path = self.base_path / "historico_envios.csv"
-            arquivo_existe = historico_path.exists()
-            
-            with open(historico_path, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-                if not arquivo_existe:
-                    writer.writerow(['Data', 'Paciente', 'Telefone', 'Medico', 'DataConsulta', 'HoraConsulta', 'Chave', 'Status'])
-                writer.writerow([
-                    datetime.now().isoformat(),
-                    consulta.get('nome', ''),
-                    consulta.get('telefone', ''),
-                    medico,
-                    consulta.get('data', ''),
-                    consulta.get('hora', ''),
-                    chave,
-                    'Enviado' if sucesso else 'Falha'
-                ])
-    
-    def calcular_prioridade(self, data_str: str, hora_str: str) -> int:
-        if not data_str:
-            return Prioridade.BAIXA.value
-        
-        try:
-            data_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', data_str)
-            if not data_match:
-                return Prioridade.BAIXA.value
-            data_limpa = data_match.group(1)
-            
-            data = None
-            for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d/%m/%y']:
-                try:
-                    data = datetime.strptime(data_limpa, fmt)
-                    break
-                except ValueError:
-                    continue
-            
-            if not data:
-                return Prioridade.BAIXA.value
-            
-            hora = None
-            if hora_str:
-                hora_match = re.search(r'(\d{2}:\d{2})', hora_str)
-                if hora_match:
-                    hora_limpa = hora_match.group(1)
-                    try:
-                        hora = datetime.strptime(hora_limpa, '%H:%M').time()
-                    except ValueError:
-                        pass
-            
-            data_hora = datetime.combine(data.date(), hora) if hora else data
-            horas = (data_hora - datetime.now()).total_seconds() / 3600
-            
-            if horas < 0:
-                return Prioridade.EXPIRADO.value
-            if horas < 1:
-                return Prioridade.URGENTISSIMO.value
-            if horas < 3:
-                return Prioridade.URGENTE.value
-            if horas < 6:
-                return Prioridade.NORMAL.value
-            return Prioridade.BAIXA.value
-        except Exception:
-            return Prioridade.BAIXA.value
-    
-    def adicionar(self, consulta: dict, medico: str, chave: str):
-        prioridade = self.calcular_prioridade(consulta.get('data', ''), consulta.get('hora', ''))
-        consulta_id = f"{consulta.get('nome', '')}_{medico}_{time.time()}"
-        item = ConsultaPriorizada(
-            prioridade=prioridade,
-            timestamp=time.time(),
-            consulta_id=consulta_id,
-            dados={'consulta': consulta, 'medico': medico, 'chave': chave},
-            tentativas=0
-        )
-        self.fila.put(item)
-        self.logger.log(f"ENFILEIRADO: {consulta.get('nome', '?')[:15]} | Prioridade: {prioridade}")
-    
-    def _montar_mensagem(self, consulta: dict, medico: str, chave: str) -> str:
-        return f"""Olá {consulta.get('nome', 'paciente')}!
-
-Sua consulta com Dr(a). {medico} está agendada para {consulta.get('data', 'data a confirmar')} às {consulta.get('hora', 'horário a confirmar')}.
-
-✅ Chave de confirmação: {chave}
-
-Por favor, confirme sua presença.
-
-Atenciosamente, Clínica"""
-    
-    def stop(self):
-        self.rodando = False
-        self.executor.shutdown(wait=True)
 
 
 # ============================================================================
@@ -713,7 +571,7 @@ class GerenciadorPastas:
 
 
 # ============================================================================
-# AUTOMAÇÃO DE DOWNLOADS (com arquivos na base_path)
+# AUTOMAÇÃO DE DOWNLOADS
 # ============================================================================
 
 class AutomacaoDownloads:
@@ -796,7 +654,6 @@ class AutomacaoDownloads:
         print("DOWNLOAD AUTOMÁTICO")
         print("="*60)
         
-        # Snapshot antes do download
         pdfs_antes = set(Path(pasta_downloads).glob('*.pdf'))
         
         tentativa = 1
@@ -830,7 +687,7 @@ class AutomacaoDownloads:
 
 
 # ============================================================================
-# LISTENERS SIMPLIFICADOS (apenas teclas específicas)
+# LISTENERS
 # ============================================================================
 
 class KeyboardListener:
@@ -897,7 +754,7 @@ class MouseListener:
 
 
 # ============================================================================
-# PROCESSADOR DE PDFS (com regex melhorada)
+# PROCESSADOR DE PDFS
 # ============================================================================
 
 class ProcessadorPDF:
@@ -906,7 +763,6 @@ class ProcessadorPDF:
         self.gerenciador_pastas = gerenciador_pastas
     
     def extrair_com_regex(self, texto: str) -> dict:
-        """Extrai dados usando regex (sem capturar newlines)"""
         dados = {
             'nome': None,
             'telefone': None,
@@ -915,33 +771,28 @@ class ProcessadorPDF:
             'medicos': []
         }
         
-        # Busca nome (sem \s, apenas caracteres de nome)
         nome_match = re.search(r'(?:Nome|Paciente)[:\s]+([A-Za-zÀ-Úà-ú][^\n]*)', texto, re.IGNORECASE)
         if nome_match:
             dados['nome'] = nome_match.group(1).strip()
         
-        # Busca telefone
         telefone_match = re.search(r'(?:Telefone|Tel|Fone)[:\s]+([\d\(\)\s-]+)', texto, re.IGNORECASE)
         if telefone_match:
             dados['telefone'] = re.sub(r'\D', '', telefone_match.group(1))
         
-        # Busca data (apenas o padrão, não a linha inteira)
         data_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', texto)
         if data_match:
             dados['data'] = data_match.group(1)
         
-        # Busca hora (apenas o padrão)
         hora_match = re.search(r'(\d{2}:\d{2})', texto)
         if hora_match:
             dados['hora'] = hora_match.group(1)
         
-        # Busca médicos (sem \s)
         medicos_match = re.findall(r'(?:Dr|Dra|Médico)[:\s]+([A-Za-zÀ-Úà-ú][^\n]*)', texto, re.IGNORECASE)
         dados['medicos'] = [m.strip() for m in medicos_match if m.strip()]
         
         return dados
     
-    def extrair_e_processar(self, pasta_medico: str, fila: FilaPrioritaria) -> int:
+    def extrair_e_processar(self, pasta_medico: str, fila: 'FilaPrioritaria') -> int:
         pasta = Path(pasta_medico)
         if not pasta.exists():
             return 0
@@ -960,11 +811,8 @@ class ProcessadorPDF:
             try:
                 with pdfplumber.open(str(pdf)) as p:
                     texto = p.extract_text()
-                    
-                    # Tenta extração por regex primeiro
                     dados = self.extrair_com_regex(texto)
                     
-                    # Fallback: tenta por linha se regex falhou
                     if not dados['nome'] or not dados['telefone']:
                         linhas = texto.split('\n')
                         for i, linha in enumerate(linhas):
@@ -974,7 +822,6 @@ class ProcessadorPDF:
                             if 'telefone' in linha.lower() or 'tel' in linha.lower():
                                 if i + 1 < len(linhas):
                                     dados['telefone'] = re.sub(r'\D', '', linhas[i + 1].strip())
-                            # Apenas o padrão da data/hora, não a linha toda
                             data_padrao = re.search(r'(\d{2}/\d{2}/\d{4})', linha)
                             if data_padrao:
                                 dados['data'] = data_padrao.group(1)
@@ -990,14 +837,13 @@ class ProcessadorPDF:
                             print(f"      ✓ {dados['nome'][:20]} → Dr. {medico}")
                         sucesso = True
                     else:
-                        print(f"      ⚠️ Dados incompletos: Nome={dados['nome']}, Tel={dados['telefone']}, Médicos={len(dados['medicos'])}")
+                        print(f"      ⚠️ Dados incompletos")
                         self.gerenciador_pastas.mover_para_erros(pdf, "Dados incompletos")
             
             except Exception as e:
                 print(f"      ❌ Erro: {str(e)[:50]}")
                 self.gerenciador_pastas.mover_para_erros(pdf, f"Erro: {str(e)[:50]}")
             
-            # Só remove o PDF se processou com sucesso
             if sucesso:
                 try:
                     pdf.unlink()
@@ -1006,6 +852,190 @@ class ProcessadorPDF:
                     print(f"      ⚠️ Não foi possível remover: {e}")
         
         return processados
+
+
+# ============================================================================
+# FILA PRIORITÁRIA COM CONSUMIDOR REAL (CORRIGIDO - RLock)
+# ============================================================================
+
+class FilaPrioritaria:
+    def __init__(self, logger: LoggerAuditoria, whatsapp: WhatsAppReal, base_path: Path):
+        self.logger = logger
+        self.whatsapp = whatsapp
+        self.base_path = base_path
+        self.fila = queue.PriorityQueue()
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.rodando = True
+        self.enviados = set()
+        self.falhas: Dict[str, int] = {}
+        self._lock = threading.RLock()  # ← RLock para evitar deadlock
+        self._start_worker()
+    
+    def _start_worker(self):
+        def worker():
+            while self.rodando:
+                try:
+                    item = self.fila.get(timeout=1)
+                    self.executor.submit(self._enviar, item)
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    self.logger.log(f"ERRO_WORKER: {str(e)[:50]}")
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    def _enviar(self, item: ConsultaPriorizada):
+        try:
+            dados = item.dados
+            consulta = dados['consulta']
+            medico = dados['medico']
+            chave = dados['chave']
+            
+            chave_unica = f"{consulta.get('nome', '')}_{medico}_{consulta.get('data', '')}"
+            
+            with self._lock:
+                if chave_unica in self.enviados:
+                    self.logger.log(f"DUPLICADA IGNORADA: {chave_unica}")
+                    return
+            
+            mensagem = self._montar_mensagem(consulta, medico, chave)
+            telefone = self._normalizar_telefone(consulta.get('telefone', ''))
+            
+            sucesso = self.whatsapp.enviar(telefone, mensagem)
+            
+            with self._lock:
+                if sucesso:
+                    self.enviados.add(chave_unica)
+                    self._salvar_historico(consulta, medico, chave, sucesso)
+                    status = 'OK'
+                else:
+                    self.falhas[chave_unica] = self.falhas.get(chave_unica, 0) + 1
+                    if self.falhas[chave_unica] < 3:
+                        novo_item = ConsultaPriorizada(
+                            prioridade=Prioridade.BAIXA.value,
+                            timestamp=time.time(),
+                            consulta_id=item.consulta_id,
+                            dados=item.dados,
+                            tentativas=item.tentativas + 1
+                        )
+                        self.fila.put(novo_item)
+                        status = f'RETRY {self.falhas[chave_unica]}'
+                    else:
+                        self._salvar_historico(consulta, medico, chave, sucesso)
+                        status = 'FALHA_PERMANENTE'
+            
+            self.logger.log(f"ENVIO: {consulta.get('nome', '?')[:15]} | {status}")
+            
+        except Exception as e:
+            self.logger.log(f"ERRO_ENVIO: {str(e)[:50]}")
+    
+    def _normalizar_telefone(self, telefone: str) -> str:
+        if not telefone:
+            return ""
+        apenas_numeros = re.sub(r'\D', '', telefone)
+        if len(apenas_numeros) < 10:
+            return ""
+        if len(apenas_numeros) == 10:
+            return "55" + apenas_numeros
+        if len(apenas_numeros) == 11:
+            return "55" + apenas_numeros
+        if len(apenas_numeros) == 13 and apenas_numeros.startswith('55'):
+            return apenas_numeros
+        return "55" + apenas_numeros[-11:] if len(apenas_numeros) > 11 else ""
+    
+    def _salvar_historico(self, consulta: dict, medico: str, chave: str, sucesso: bool):
+        # NOTA: Este método é chamado dentro do lock, então não precisa de outro lock
+        historico_path = self.base_path / "historico_envios.csv"
+        arquivo_existe = historico_path.exists()
+        
+        with open(historico_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+            if not arquivo_existe:
+                writer.writerow(['Data', 'Paciente', 'Telefone', 'Medico', 'DataConsulta', 'HoraConsulta', 'Chave', 'Status'])
+            writer.writerow([
+                datetime.now().isoformat(),
+                consulta.get('nome', ''),
+                consulta.get('telefone', ''),
+                medico,
+                consulta.get('data', ''),
+                consulta.get('hora', ''),
+                chave,
+                'Enviado' if sucesso else 'Falha'
+            ])
+    
+    def calcular_prioridade(self, data_str: str, hora_str: str) -> int:
+        if not data_str:
+            return Prioridade.BAIXA.value
+        
+        try:
+            data_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', data_str)
+            if not data_match:
+                return Prioridade.BAIXA.value
+            data_limpa = data_match.group(1)
+            
+            data = None
+            for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d/%m/%y']:
+                try:
+                    data = datetime.strptime(data_limpa, fmt)
+                    break
+                except ValueError:
+                    continue
+            
+            if not data:
+                return Prioridade.BAIXA.value
+            
+            hora = None
+            if hora_str:
+                hora_match = re.search(r'(\d{2}:\d{2})', hora_str)
+                if hora_match:
+                    hora_limpa = hora_match.group(1)
+                    try:
+                        hora = datetime.strptime(hora_limpa, '%H:%M').time()
+                    except ValueError:
+                        pass
+            
+            data_hora = datetime.combine(data.date(), hora) if hora else data
+            horas = (data_hora - datetime.now()).total_seconds() / 3600
+            
+            if horas < 0:
+                return Prioridade.EXPIRADO.value
+            if horas < 1:
+                return Prioridade.URGENTISSIMO.value
+            if horas < 3:
+                return Prioridade.URGENTE.value
+            if horas < 6:
+                return Prioridade.NORMAL.value
+            return Prioridade.BAIXA.value
+        except Exception:
+            return Prioridade.BAIXA.value
+    
+    def adicionar(self, consulta: dict, medico: str, chave: str):
+        prioridade = self.calcular_prioridade(consulta.get('data', ''), consulta.get('hora', ''))
+        consulta_id = f"{consulta.get('nome', '')}_{medico}_{time.time()}"
+        item = ConsultaPriorizada(
+            prioridade=prioridade,
+            timestamp=time.time(),
+            consulta_id=consulta_id,
+            dados={'consulta': consulta, 'medico': medico, 'chave': chave},
+            tentativas=0
+        )
+        self.fila.put(item)
+        self.logger.log(f"ENFILEIRADO: {consulta.get('nome', '?')[:15]} | Prioridade: {prioridade}")
+    
+    def _montar_mensagem(self, consulta: dict, medico: str, chave: str) -> str:
+        return f"""Olá {consulta.get('nome', 'paciente')}!
+
+Sua consulta com Dr(a). {medico} está agendada para {consulta.get('data', 'data a confirmar')} às {consulta.get('hora', 'horário a confirmar')}.
+
+✅ Chave de confirmação: {chave}
+
+Por favor, confirme sua presença.
+
+Atenciosamente, Clínica"""
+    
+    def stop(self):
+        self.rodando = False
+        self.executor.shutdown(wait=True)
 
 
 # ============================================================================
@@ -1025,8 +1055,8 @@ class WAM:
     
     def _exibir_termo(self):
         print("\n" + "="*80)
-        print("WAM - WHATSAPP AUTOMATE MESSAGE v5.3")
-        print("COM INTEGRAÇÃO REAL COM WHATSAPP WEB")
+        print("WAM - WHATSAPP AUTOMATE MESSAGE v5.4")
+        print("VERSÃO COMPLETA - CORREÇÕES DE DEADLOCK E SELETORES")
         print("RESPONSABILIDADE EXCLUSIVA DO USUÁRIO")
         print("="*80)
         print("""
@@ -1050,7 +1080,7 @@ class WAM:
     def menu(self):
         while True:
             print("\n" + "="*50)
-            print("WAM - WHATSAPP AUTOMATE v5.3")
+            print("WAM - WHATSAPP AUTOMATE v5.4")
             print("="*50)
             print("1. CONFIGURAR PASTAS")
             print("2. GRAVAR CLIQUES")
@@ -1124,7 +1154,6 @@ class WAM:
         self.downloads = AutomacaoDownloads(self.logger, self.base_path)
         self.processador = ProcessadorPDF(self.logger, self.pastas)
         
-        # Inicializa WhatsApp
         self.whatsapp = WhatsAppReal(self.logger, self.base_path)
         self.fila = FilaPrioritaria(self.logger, self.whatsapp, self.base_path)
         
@@ -1170,8 +1199,8 @@ class WAM:
 def main():
     print("""
     ╔══════════════════════════════════════════════════════════════════╗
-    ║     WAM - WHATSAPP AUTOMATE MESSAGE v5.3                         ║
-    ║     COM INTEGRAÇÃO REAL COM WHATSAPP WEB                        ║
+    ║     WAM - WHATSAPP AUTOMATE MESSAGE v5.4                         ║
+    ║     VERSÃO COMPLETA - CORREÇÕES DE DEADLOCK E SELETORES         ║
     ║     github.com/luisfernandosiqueirasilva/whatsapp_automate_msg   ║
     ╚══════════════════════════════════════════════════════════════════╝
     """)
