@@ -66,3 +66,19 @@ faz envio de msg automaicamente no whatsapp com dados sensiveis
 ## ⚠️ DISCLAIMER LEGAL
 
 > **LEIA ATENTAMENTE ANTES DE UTILIZAR**
+> 
+> Sistema de Parada a Qualquer Momento 🛑
+Ctrl+Shift+P → Para a execução imediatamente
+
+Ctrl+Shift+Espaço → Pausa/retoma a execução
+
+Sistema de arquivos de sinalização (STOP_SIGNAL.flg e PAUSE_SIGNAL.flg)
+
+Verificação constante durante processamento de PDFs e envio de mensagens
+
+Salvar e Carregar Configurações 💾
+Todas as configurações são salvas automaticamente em configuracoes.json
+
+Carrega automaticamente as últimas configurações ao iniciar
+
+
